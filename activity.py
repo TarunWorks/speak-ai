@@ -1467,7 +1467,7 @@ class SpeakActivity(activity.Activity):
             new_voice = None
             for name in list(brain.BOTS.keys()):
                 if self._current_voice[0].short_name == name:
-                    new_voice == self._current_voice[0]
+                    new_voice = self._current_voice[0]
                     break
             if new_voice is None:
                 new_voice = brain.get_default_voice()
