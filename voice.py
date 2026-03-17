@@ -123,13 +123,17 @@ def allVoices():
 
     en_name = _friendly_name('English')
     if en_name not in _allVoices:
-        _allVoices[en_name] = _allVoices[_friendly_name('English (America)')]
-        _allVoices[en_name].friendlyname = en_name
+        en_america = _allVoices.get(_friendly_name('English (America)'))
+        if en_america is not None:
+            _allVoices[en_name] = en_america
+            _allVoices[en_name].friendlyname = en_name
 
     es_name = _friendly_name('Spanish')
     if es_name not in _allVoices:
-        _allVoices[es_name] = _allVoices[_friendly_name('Spanish (Latin America)')]
-        _allVoices[es_name].friendlyname = es_name
+        es_la = _allVoices.get(_friendly_name('Spanish (Latin America)'))
+        if es_la is not None:
+            _allVoices[es_name] = es_la
+            _allVoices[es_name].friendlyname = es_name
 
     return _allVoices
 
@@ -179,7 +183,13 @@ def defaultVoice():
     es_la_name = _friendly_name('Spanish (Latin America)')
     en_au_name = _friendly_name('English (Received Pronunciation)')
 
-    for voice in list(voices.values()):
+    voices_list = list(voices.values())
+    # Ensure best is initialised before the ranking loop even if no known
+    # English voice was found above.
+    if best is None and voices_list:
+        best = voices_list[0]
+
+    for voice in voices_list:
         voiceMetric = fit(voice.language, lang)
         bestMetric = fit(best.language, lang)
         if lang == 'en_AU.UTF-8':

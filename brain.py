@@ -78,8 +78,8 @@ def _get_age():
 
 def get_default_voice():
     default_voice = voice.defaultVoice()
-    if default_voice.friendlyname not in BOTS:
-        return voice.allVoices()[_('English')]
+    if default_voice is None or default_voice.friendlyname not in BOTS:
+        return voice.allVoices().get(_('English'))
     else:
         return default_voice
 

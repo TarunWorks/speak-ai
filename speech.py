@@ -18,6 +18,7 @@
 
 import numpy
 import threading
+from collections import OrderedDict
 
 from gi.repository import Gst
 from gi.repository import GLib
@@ -41,6 +42,27 @@ PITCH_MAX = 200
 RATE_MIN = 0
 RATE_MAX = 200
 
+# Maps the two-character voice-name prefix to the KPipeline lang_code.
+# Mirrors the LANG_CODES / ALIASES dicts in kokoro/pipeline.py.
+VOICE_TO_LANG = {
+    'af': 'a', 'am': 'a',  # American English
+    'bf': 'b', 'bm': 'b',  # British English
+    'ef': 'e', 'em': 'e',  # Spanish
+    'ff': 'f',              # French
+    'hf': 'h', 'hm': 'h',  # Hindi
+    'if': 'i', 'im': 'i',  # Italian
+    'jf': 'j', 'jm': 'j',  # Japanese
+    'pf': 'p', 'pm': 'p',  # Portuguese (Brazilian)
+    'zf': 'z', 'zm': 'z',  # Mandarin Chinese
+}
+
+# Maximum number of KPipeline instances kept in the LRU cache.
+_PIPELINE_CACHE_MAX = 2
+
+# Seconds to wait for the GStreamer bus to confirm end-of-stream after all
+# audio buffers have been pushed.  10 s is generous even for long utterances.
+_EOS_DRAIN_TIMEOUT = 10.0
+
 
 class Speech(GstSpeechPlayer):
     __gsignals__ = {
@@ -52,11 +74,19 @@ class Speech(GstSpeechPlayer):
     def __init__(self):
         GstSpeechPlayer.__init__(self)
         self.pipeline = None
-        
-        # Initialize Kokoro pipeline if available
+
+        # LRU cache of KPipeline instances keyed by lang_code.
+        # Protected by _kokoro_lock for thread safety (setup_kokoro runs in a
+        # background thread while _get_or_create_pipeline may be called later
+        # from the main thread).
+        self._kokoro_lock = threading.Lock()
+        self._kokoro_pipelines = OrderedDict()  # lang_code -> KPipeline
+
+        # kokoro_pipeline acts as a readiness flag (True once at least one
+        # pipeline has been initialised, None while pending).
         self.kokoro_pipeline = None
         if KOKORO_AVAILABLE:
-            threading.Thread(target=self.setup_kokoro).start()
+            threading.Thread(target=self.setup_kokoro, daemon=True).start()
         
         # Predefined Kokoro voices for future GUI selection - TODO
         self.kokoro_voices = [
@@ -77,7 +107,41 @@ class Speech(GstSpeechPlayer):
             self._cb[cb] = None
 
     def setup_kokoro(self):
-        self.kokoro_pipeline = KPipeline(lang_code='a')
+        pipeline = KPipeline(lang_code='a')
+        with self._kokoro_lock:
+            self._kokoro_pipelines['a'] = pipeline
+            self.kokoro_pipeline = True  # readiness flag
+
+    def _lang_for_voice(self, voice_name):
+        """Return the KPipeline lang_code for *voice_name*.
+
+        Uses the two-character prefix of the voice name (e.g. 'hf' → 'h' for
+        Hindi) to look up VOICE_TO_LANG.  Falls back to 'a' (American English)
+        for unknown prefixes.
+        """
+        prefix = voice_name[:2] if len(voice_name) >= 2 else ''
+        return VOICE_TO_LANG.get(prefix, 'a')
+
+    def _get_or_create_pipeline(self, lang_code):
+        """Return a KPipeline for *lang_code*, creating one if necessary.
+
+        Implements an LRU eviction policy: the least-recently-used entry is
+        dropped once the cache exceeds _PIPELINE_CACHE_MAX entries.  All
+        access is serialised through _kokoro_lock.
+        """
+        with self._kokoro_lock:
+            if lang_code in self._kokoro_pipelines:
+                self._kokoro_pipelines.move_to_end(lang_code)
+                return self._kokoro_pipelines[lang_code]
+
+            pipeline = KPipeline(lang_code=lang_code)
+            self._kokoro_pipelines[lang_code] = pipeline
+
+            # Evict the least-recently-used entry when over capacity.
+            while len(self._kokoro_pipelines) > _PIPELINE_CACHE_MAX:
+                self._kokoro_pipelines.popitem(last=False)
+
+            return pipeline
 
     def disconnect_all(self):
         for cb in ['peak', 'wave', 'idle']:
@@ -325,38 +389,63 @@ class Speech(GstSpeechPlayer):
         bus.connect('message', gst_message_cb)
 
     def _stream_kokoro_audio(self, text, voice):
-        """Stream Kokoro audio chunks to the GStreamer pipeline"""
+        """Stream Kokoro audio chunks to the GStreamer pipeline.
+
+        Selects the KPipeline matching *voice*'s language via the LRU cache,
+        pushes all audio buffers to appsrc, then signals end-of-stream and
+        waits (EOS drain) so the pipeline fully processes the audio before
+        this call returns.
+        """
+        appsrc = None
         try:
             # Getting the appsrc element
             appsrc = self.pipeline.get_by_name('kokoro_src')
             if not appsrc:
                 logger.error("Could not find kokoro_src element")
                 return
-            
+
             # Set caps for Kokoro audio
             caps = Gst.Caps.from_string(
                 "audio/x-raw,format=F32LE,layout=interleaved,rate=24000,channels=1"
             )
             appsrc.set_property("caps", caps)
 
-            audio_generator = self.kokoro_pipeline(text, voice=voice) # actual audio generation by kokoro
+            lang_code = self._lang_for_voice(voice)
+            kokoro_pipe = self._get_or_create_pipeline(lang_code)
+            audio_generator = kokoro_pipe(text, voice=voice)
 
             # Stream audio chunks
             for i, (gs, ps, audio_chunk) in enumerate(audio_generator):
                 # Convert tensor to numpy array then to bytes
                 data_bytes = audio_chunk.numpy().tobytes()
-                
+
                 # Create GStreamer buffer
                 buf = Gst.Buffer.new_wrapped(data_bytes)
-                
+
                 # Push buffer to appsrc
                 ret = appsrc.emit("push-buffer", buf)
                 if ret != Gst.FlowReturn.OK:
                     logger.error(f"Error pushing buffer {i} to GStreamer")
                     break
 
-            appsrc.emit("end-of-stream") # Signal EOS
-            
+            # EOS drain: signal end-of-stream and wait for the bus to confirm
+            # that the pipeline has fully consumed all queued buffers.
+            eos_event = threading.Event()
+
+            def _on_eos(bus, message):
+                if message.type == Gst.MessageType.EOS:
+                    eos_event.set()
+                    return True
+                return False
+
+            bus = self.pipeline.get_bus()
+            handler_id = bus.connect('message', _on_eos)
+            try:
+                appsrc.emit("end-of-stream")
+                eos_event.wait(timeout=_EOS_DRAIN_TIMEOUT)
+            finally:
+                bus.disconnect(handler_id)
+
         except Exception as e:
             # Signalling EOS here as well, but I'm adding error to logs
             logger.error(f"Error in Kokoro audio streaming: {e}")
